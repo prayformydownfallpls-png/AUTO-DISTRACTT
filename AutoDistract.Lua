@@ -1,4 +1,5 @@
 
+
 -- AUTO DISTRACT GUI - Roblox Studio LocalScript
 -- Place in StarterPlayer > StarterPlayerScripts.
 -- Tag each NPC MODEL with CollectionService tag "Twisted".
@@ -9,6 +10,10 @@ local CHECK_INTERVAL = 0.5
 local PATH_RETRY_INTERVAL = 1
 local AWARENESS_DISTANCE = 80
 local OBSTACLE_DISTANCE = 12
+
+-- Treat a Twisted as charging when it is moving quickly toward the player.
+local SPRINT_SPEED_THRESHOLD = 10
+local SPRINT_TOWARD_DOT_THRESHOLD = 0.65
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
@@ -196,6 +201,32 @@ local function getRoot(model)
     return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
+-- Ignore Squirm completely (targeting, ESP, and threat counts).
+local function isExcluded(model)
+    return model and model.Name:lower() == "squirm"
+end
+
+-- True when the NPC is moving quickly in the direction of the player.
+local function isSprintingAtPlayer(playerRoot, enemyRoot)
+    if not playerRoot or not enemyRoot then
+        return false
+    end
+
+    local velocity = enemyRoot.AssemblyLinearVelocity
+    local speed = velocity.Magnitude
+    if speed < SPRINT_SPEED_THRESHOLD then
+        return false
+    end
+
+    local towardPlayer = playerRoot.Position - enemyRoot.Position
+    if towardPlayer.Magnitude <= 0 then
+        return false
+    end
+
+    local alignment = velocity.Unit:Dot(towardPlayer.Unit)
+    return alignment >= SPRINT_TOWARD_DOT_THRESHOLD
+end
+
 -- ESP
 local function removeESP(model)
     local info = tracked[model]
@@ -251,7 +282,7 @@ local function getValidTwisteds()
     local valid = {}
 
     for _, model in ipairs(CollectionService:GetTagged("Twisted")) do
-        if model:IsA("Model") and model:IsDescendantOf(workspace) then
+        if model:IsA("Model") and model:IsDescendantOf(workspace) and not isExcluded(model) then
             local root = getRoot(model)
             local humanoid = model:FindFirstChildOfClass("Humanoid")
 
@@ -390,7 +421,7 @@ task.spawn(function()
         -- ESP updates
         if settings.esp then
             for _, model in ipairs(taggedTwisteds) do
-                if model:IsA("Model") and model:IsDescendantOf(workspace) then
+                if model:IsA("Model") and model:IsDescendantOf(workspace) and not isExcluded(model) then
                     addESP(model)
                 end
             end
@@ -415,7 +446,21 @@ task.spawn(function()
             threatText, obstacleText, nearest, nearestDistance =
                 checkSurroundings(character, root, validTwisteds)
 
-            currentTarget = closestTwisted(root, validTwisteds)
+            -- Prefer a Twisted actively sprinting toward the player.
+            local chargingTarget = nil
+            local chargingDistance = math.huge
+            for _, model in ipairs(validTwisteds) do
+                local enemyRoot = getRoot(model)
+                if enemyRoot and isSprintingAtPlayer(root, enemyRoot) then
+                    local distance = (root.Position - enemyRoot.Position).Magnitude
+                    if distance < chargingDistance then
+                        chargingTarget = model
+                        chargingDistance = distance
+                    end
+                end
+            end
+
+            currentTarget = chargingTarget or closestTwisted(root, validTwisteds)
 
             -- Auto Aggro
             if settings.aggro and currentTarget then
@@ -425,14 +470,16 @@ task.spawn(function()
                     requestMove(character, humanoid, root, enemyRoot.Position)
                 end
 
-            -- Auto Run Away
+            -- Auto Run Away: flee immediately from a charging Twisted,
+            -- even when it is still outside the normal safe distance.
             elseif settings.run and currentTarget then
                 local enemyRoot = getRoot(currentTarget)
 
                 if enemyRoot then
                     local distance = (root.Position - enemyRoot.Position).Magnitude
+                    local charging = isSprintingAtPlayer(root, enemyRoot)
 
-                    if distance < SAFE_DISTANCE then
+                    if charging or distance < SAFE_DISTANCE then
                         local away = root.Position - enemyRoot.Position
 
                         if away.Magnitude > 0 then
