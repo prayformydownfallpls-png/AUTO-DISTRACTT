@@ -1,11 +1,14 @@
+
 -- AUTO DISTRACT GUI - Roblox Studio LocalScript
--- Put this LocalScript in StarterPlayer > StarterPlayerScripts.
--- Tag each NPC MODEL with the CollectionService tag "Twisted".
+-- Place in StarterPlayer > StarterPlayerScripts.
+-- Tag each NPC MODEL with CollectionService tag "Twisted".
 
 local SAFE_DISTANCE = 30
 local RETREAT_DISTANCE = 45
 local CHECK_INTERVAL = 0.5
 local PATH_RETRY_INTERVAL = 1
+local AWARENESS_DISTANCE = 80
+local OBSTACLE_DISTANCE = 12
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
@@ -14,20 +17,21 @@ local PathfindingService = game:GetService("PathfindingService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Avoid creating duplicate GUIs if the LocalScript restarts.
+-- Remove duplicate GUI
 local oldGui = playerGui:FindFirstChild("AutoDistractGUI")
 if oldGui then
     oldGui:Destroy()
 end
 
+-- GUI
 local gui = Instance.new("ScreenGui")
 gui.Name = "AutoDistractGUI"
 gui.ResetOnSpawn = false
 gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(290, 390)
-frame.Position = UDim2.new(0.5, -145, 0.5, -195)
+frame.Size = UDim2.fromOffset(290, 455)
+frame.Position = UDim2.new(0.5, -145, 0.5, -227)
 frame.BackgroundColor3 = Color3.fromRGB(28, 20, 38)
 frame.Active = true
 frame.Draggable = true
@@ -61,23 +65,27 @@ local distractButton = makeButton("AUTO DISTRACT", 55)
 local espButton = makeButton("TWISTED ESP", 105)
 local aggroButton = makeButton("AUTO AGGRO", 155)
 local runButton = makeButton("AUTO RUN AWAY", 205)
+local noclipButton = makeButton("NOCLIP", 255)
 
 local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -20, 0, 65)
-status.Position = UDim2.new(0, 10, 0, 265)
+status.Size = UDim2.new(1, -20, 0, 115)
+status.Position = UDim2.new(0, 10, 0, 315)
 status.BackgroundTransparency = 1
 status.TextColor3 = Color3.new(1, 1, 1)
 status.TextSize = 12
 status.TextWrapped = true
+status.TextYAlignment = Enum.TextYAlignment.Top
 status.Font = Enum.Font.Gotham
-status.Text = "Twisteds tagged: 0\nValid targets: 0\nTarget: None"
+status.Text = "Twisteds tagged: 0\nValid targets: 0\nTarget: None\nNearest threat: None\nObstacle ahead: Unknown"
 status.Parent = frame
 
+-- Settings
 local settings = {
     distract = false,
     esp = false,
     aggro = false,
-    run = false
+    run = false,
+    noclip = false
 }
 
 local tracked = {}
@@ -85,6 +93,7 @@ local currentTarget = nil
 local movementToken = 0
 local lastPathTime = 0
 
+-- Toggle handling
 local function connectToggle(button, key, name)
     button.MouseButton1Click:Connect(function()
         settings[key] = not settings[key]
@@ -97,6 +106,79 @@ connectToggle(espButton, "esp", "TWISTED ESP")
 connectToggle(aggroButton, "aggro", "AUTO AGGRO")
 connectToggle(runButton, "run", "AUTO RUN AWAY")
 
+-- Character and noclip handling
+local originalCollision = setmetatable({}, {__mode = "k"})
+local characterAddedConnection
+local descendantAddedConnection
+
+local function applyNoclipToPart(part)
+    if not part:IsA("BasePart") then
+        return
+    end
+
+    if originalCollision[part] == nil then
+        originalCollision[part] = part.CanCollide
+    end
+
+    part.CanCollide = false
+end
+
+local function restoreCollision()
+    for part, originalValue in pairs(originalCollision) do
+        if part and part.Parent then
+            part.CanCollide = originalValue
+        end
+        originalCollision[part] = nil
+    end
+end
+
+local function setupCharacter(character)
+    if descendantAddedConnection then
+        descendantAddedConnection:Disconnect()
+        descendantAddedConnection = nil
+    end
+
+    if settings.noclip then
+        for _, part in ipairs(character:GetDescendants()) do
+            applyNoclipToPart(part)
+        end
+    end
+
+    descendantAddedConnection = character.DescendantAdded:Connect(function(part)
+        if settings.noclip then
+            applyNoclipToPart(part)
+        end
+    end)
+end
+
+local function setNoclip(enabled)
+    settings.noclip = enabled
+    noclipButton.Text = "NOCLIP: " .. (enabled and "ON" or "OFF")
+
+    if enabled then
+        local character = player.Character
+        if character then
+            setupCharacter(character)
+        end
+    else
+        restoreCollision()
+    end
+end
+
+noclipButton.MouseButton1Click:Connect(function()
+    setNoclip(not settings.noclip)
+end)
+
+characterAddedConnection = player.CharacterAdded:Connect(function(character)
+    task.wait(0.2)
+    setupCharacter(character)
+end)
+
+if player.Character then
+    setupCharacter(player.Character)
+end
+
+-- Find model root
 local function getRoot(model)
     if not model or not model:IsA("Model") then
         return nil
@@ -114,6 +196,7 @@ local function getRoot(model)
     return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
+-- ESP
 local function removeESP(model)
     local info = tracked[model]
     if info then
@@ -163,6 +246,7 @@ local function addESP(model)
     }
 end
 
+-- Find valid Twisted NPCs
 local function getValidTwisteds()
     local valid = {}
 
@@ -171,8 +255,6 @@ local function getValidTwisteds()
             local root = getRoot(model)
             local humanoid = model:FindFirstChildOfClass("Humanoid")
 
-            -- If an NPC has no Humanoid, it can still be shown by ESP,
-            -- but it cannot be selected as a living movement target.
             if root and humanoid and humanoid.Health > 0 then
                 table.insert(valid, model)
             end
@@ -182,6 +264,7 @@ local function getValidTwisteds()
     return valid
 end
 
+-- Find closest Twisted
 local function closestTwisted(playerRoot, candidates)
     local closest = nil
     local closestDistance = math.huge
@@ -190,6 +273,7 @@ local function closestTwisted(playerRoot, candidates)
         local enemyRoot = getRoot(model)
         if enemyRoot then
             local distance = (playerRoot.Position - enemyRoot.Position).Magnitude
+
             if distance < closestDistance then
                 closest = model
                 closestDistance = distance
@@ -200,10 +284,36 @@ local function closestTwisted(playerRoot, candidates)
     return closest, closestDistance
 end
 
+-- Surroundings awareness
+local function checkSurroundings(character, root, candidates)
+    local nearest, nearestDistance = closestTwisted(root, candidates)
+
+    local threatText = "None"
+    if nearest and nearestDistance <= AWARENESS_DISTANCE then
+        threatText = nearest.Name .. " (" .. math.floor(nearestDistance) .. " studs)"
+    elseif nearest then
+        threatText = "No nearby threat"
+    end
+
+    -- Raycast ahead to check for obstacles
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {character}
+
+    local direction = root.CFrame.LookVector * OBSTACLE_DISTANCE
+    local result = workspace:Raycast(root.Position, direction, rayParams)
+
+    local obstacleText = result and result.Instance.Name or "Clear"
+
+    return threatText, obstacleText, nearest, nearestDistance
+end
+
+-- Stop existing movement
 local function stopMovement()
     movementToken += 1
 end
 
+-- Pathfinding
 local function moveAlongPath(character, humanoid, root, destination, token)
     local path = PathfindingService:CreatePath({
         AgentRadius = 2,
@@ -220,8 +330,9 @@ local function moveAlongPath(character, humanoid, root, destination, token)
         return
     end
 
+    if token ~= movementToken then return end
+
     if path.Status ~= Enum.PathStatus.Success then
-        -- Fallback: attempt a direct MoveTo if no path can be computed.
         humanoid:MoveTo(destination)
         return
     end
@@ -236,12 +347,14 @@ local function moveAlongPath(character, humanoid, root, destination, token)
 
         humanoid:MoveTo(waypoint.Position)
         local reached = humanoid.MoveToFinished:Wait()
+
         if not reached then return end
     end
 end
 
 local function requestMove(character, humanoid, root, destination)
     local now = os.clock()
+
     if now - lastPathTime < PATH_RETRY_INTERVAL then
         return
     end
@@ -255,6 +368,7 @@ local function requestMove(character, humanoid, root, destination)
     end)
 end
 
+-- Main loop
 task.spawn(function()
     while gui.Parent do
         local character = player.Character
@@ -262,9 +376,18 @@ task.spawn(function()
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 
         local taggedTwisteds = CollectionService:GetTagged("Twisted")
-        local validTwisteds = {}
+        local validTwisteds = getValidTwisteds()
 
-        -- ESP can display tagged models even if they are not Humanoid NPCs.
+        -- Maintain noclip on newly added character parts
+        if settings.noclip and character then
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    applyNoclipToPart(part)
+                end
+            end
+        end
+
+        -- ESP updates
         if settings.esp then
             for _, model in ipairs(taggedTwisteds) do
                 if model:IsA("Model") and model:IsDescendantOf(workspace) then
@@ -283,27 +406,41 @@ task.spawn(function()
             end
         end
 
-        validTwisteds = getValidTwisteds()
+        local threatText = "Unknown"
+        local obstacleText = "Unknown"
+        local nearestDistance = math.huge
 
         if root and humanoid and humanoid.Health > 0 then
+            local nearest
+            threatText, obstacleText, nearest, nearestDistance =
+                checkSurroundings(character, root, validTwisteds)
+
             currentTarget = closestTwisted(root, validTwisteds)
 
+            -- Auto Aggro
             if settings.aggro and currentTarget then
                 local enemyRoot = getRoot(currentTarget)
+
                 if enemyRoot then
                     requestMove(character, humanoid, root, enemyRoot.Position)
                 end
+
+            -- Auto Run Away
             elseif settings.run and currentTarget then
                 local enemyRoot = getRoot(currentTarget)
+
                 if enemyRoot then
                     local distance = (root.Position - enemyRoot.Position).Magnitude
 
                     if distance < SAFE_DISTANCE then
                         local away = root.Position - enemyRoot.Position
+
                         if away.Magnitude > 0 then
                             local destination = root.Position + away.Unit * RETREAT_DISTANCE
                             requestMove(character, humanoid, root, destination)
                         end
+                    else
+                        stopMovement()
                     end
                 end
             else
@@ -317,10 +454,29 @@ task.spawn(function()
         status.Text =
             "Twisteds tagged: " .. #taggedTwisteds ..
             "\nValid targets: " .. #validTwisteds ..
-            "\nTarget: " .. (currentTarget and currentTarget.Name or "None")
+            "\nTarget: " .. (currentTarget and currentTarget.Name or "None") ..
+            "\nNearest threat: " .. threatText ..
+            "\nObstacle ahead: " .. obstacleText ..
+            "\nNoclip: " .. (settings.noclip and "ON" or "OFF")
 
         task.wait(CHECK_INTERVAL)
     end
 end)
 
-gui.Destroying:Connect(stopMovement)
+-- Cleanup
+gui.Destroying:Connect(function()
+    stopMovement()
+    restoreCollision()
+
+    if descendantAddedConnection then
+        descendantAddedConnection:Disconnect()
+    end
+
+    if characterAddedConnection then
+        characterAddedConnection:Disconnect()
+    end
+
+    for model in pairs(tracked) do
+        removeESP(model)
+    end
+end)
