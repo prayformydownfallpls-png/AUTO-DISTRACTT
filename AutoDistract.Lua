@@ -16,7 +16,10 @@ local SPRINT_SPEED_THRESHOLD = 10
 local SPRINT_TOWARD_DOT_THRESHOLD = 0.65
 local SIGHT_RANGE = AWARENESS_DISTANCE
 local SIGHT_REENABLE_DELAY = 0.6
-local FLEE_SMOOTHING = 0.35
+local FLEE_SMOOTHING = 0.22
+local DISTRACT_SPRINT_DISTANCE = 12
+local DISTRACT_SPRINT_DURATION = 2
+local DISTRACT_SPRINT_COOLDOWN = 2.5
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
@@ -103,6 +106,45 @@ local lastPathTime = 0
 local playerSpotted = false
 local lostSightSince = nil
 local smoothedFleeDirection = Vector3.zero
+local sprintingUntil = 0
+local lastSprintTrigger = -math.huge
+local virtualInput = nil
+pcall(function()
+    virtualInput = game:GetService("VirtualInputManager")
+end)
+
+-- Shift is tapped through VirtualInputManager where the execution environment
+-- permits synthetic keyboard input. The key is always released after 2 seconds.
+local function triggerEmergencySprint()
+    local now = os.clock()
+    if now < sprintingUntil or now - lastSprintTrigger < DISTRACT_SPRINT_COOLDOWN then
+        return
+    end
+    if not virtualInput then
+        warn("Auto Distract: Shift input is unavailable in this environment.")
+        return
+    end
+
+    lastSprintTrigger = now
+    sprintingUntil = now + DISTRACT_SPRINT_DURATION
+    local ok = pcall(function()
+        virtualInput:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+    end)
+    if not ok then
+        sprintingUntil = 0
+        warn("Auto Distract: Could not send the Shift key.")
+        return
+    end
+
+    task.delay(DISTRACT_SPRINT_DURATION, function()
+        if virtualInput then
+            pcall(function()
+                virtualInput:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+            end)
+        end
+        sprintingUntil = 0
+    end)
+end
 
 -- Toggle handling
 local function connectToggle(button, key, name)
@@ -506,8 +548,37 @@ task.spawn(function()
 
             currentTarget = chargingTarget or closestTwisted(root, validTwisteds)
 
+            -- AUTO DISTRACT: when any valid Twisted has spotted you (or is
+            -- dangerously close), flee from the combined threat direction.
+            -- If one gets very close, hold Shift for exactly two seconds.
+            local distractThreat = settings.distract and
+                (playerSpotted or nearestDistance <= DISTRACT_SPRINT_DISTANCE)
+
+            if distractThreat then
+                local flee = Vector3.zero
+                local threatCount = 0
+                for _, model in ipairs(validTwisteds) do
+                    local enemyRoot = getRoot(model)
+                    if enemyRoot then
+                        local offset = root.Position - enemyRoot.Position
+                        local distance = offset.Magnitude
+                        if distance > 0 and distance <= AWARENESS_DISTANCE then
+                            flee += offset.Unit * (1 / math.max(distance, 4))
+                            threatCount += 1
+                            if distance <= DISTRACT_SPRINT_DISTANCE then
+                                triggerEmergencySprint()
+                            end
+                        end
+                    end
+                end
+
+                if threatCount > 0 and flee.Magnitude > 0.001 then
+                    smoothedFleeDirection = smoothedFleeDirection:Lerp(flee.Unit, FLEE_SMOOTHING)
+                    humanoid:Move(smoothedFleeDirection.Unit, false)
+                end
+
             -- Auto Aggro
-            if settings.aggro and not playerSpotted and currentTarget then
+            elseif settings.aggro and not playerSpotted and currentTarget then
                 local enemyRoot = getRoot(currentTarget)
 
                 if enemyRoot then
@@ -536,7 +607,6 @@ task.spawn(function()
                         if away.Magnitude > 0 then
                             -- Use continuous Humanoid steering for fleeing instead of
                             -- repeatedly rebuilding paths. This avoids stop/start jitter.
-                            stopMovement()
                             smoothedFleeDirection = smoothedFleeDirection:Lerp(away.Unit, FLEE_SMOOTHING)
                             if smoothedFleeDirection.Magnitude > 0.01 then
                                 humanoid:Move(smoothedFleeDirection.Unit, false)
@@ -567,6 +637,7 @@ task.spawn(function()
             "\nNearest threat: " .. threatText ..
             "\nObstacle ahead: " .. obstacleText ..
             "\nTwisted sight: " .. (playerSpotted and "SPOTTED" or "CLEAR") ..
+            "\nAuto Distract: " .. (settings.distract and "ON" or "OFF") ..
             "\nAuto Aggro: " .. (not settings.aggro and "OFF" or (playerSpotted and "PAUSED" or "ON")) ..
             "\nNoclip: " .. (settings.noclip and "ON" or "OFF")
         aggroButton.Text = "AUTO AGGRO: " .. (not settings.aggro and "OFF" or (playerSpotted and "PAUSED" or "ON"))
