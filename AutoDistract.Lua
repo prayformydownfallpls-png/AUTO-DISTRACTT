@@ -6,7 +6,7 @@
 
 local SAFE_DISTANCE = 30
 local RETREAT_DISTANCE = 45
-local CHECK_INTERVAL = 0.5
+local CHECK_INTERVAL = 0.1
 local PATH_RETRY_INTERVAL = 1
 local AWARENESS_DISTANCE = 80
 local OBSTACLE_DISTANCE = 12
@@ -14,6 +14,9 @@ local OBSTACLE_DISTANCE = 12
 -- Treat a Twisted as charging when it is moving quickly toward the player.
 local SPRINT_SPEED_THRESHOLD = 10
 local SPRINT_TOWARD_DOT_THRESHOLD = 0.65
+local SIGHT_RANGE = AWARENESS_DISTANCE
+local SIGHT_REENABLE_DELAY = 0.6
+local FLEE_SMOOTHING = 0.35
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
@@ -97,6 +100,9 @@ local tracked = {}
 local currentTarget = nil
 local movementToken = 0
 local lastPathTime = 0
+local playerSpotted = false
+local lostSightSince = nil
+local smoothedFleeDirection = Vector3.zero
 
 -- Toggle handling
 local function connectToggle(button, key, name)
@@ -315,6 +321,32 @@ local function closestTwisted(playerRoot, candidates)
     return closest, closestDistance
 end
 
+-- Returns true when at least one living Twisted has a clear line of sight
+-- to the player within its awareness range. This is a client-side estimate;
+-- games with custom detection systems may use different rules.
+local function isPlayerSpotted(character, playerRoot, candidates)
+    local targetPart = character:FindFirstChild("Head") or playerRoot
+    if not targetPart then return false end
+
+    for _, model in ipairs(candidates) do
+        local enemyRoot = getRoot(model)
+        if enemyRoot then
+            local offset = targetPart.Position - enemyRoot.Position
+            if offset.Magnitude <= SIGHT_RANGE then
+                local originPart = model:FindFirstChild("Head") or enemyRoot
+                local params = RaycastParams.new()
+                params.FilterType = Enum.RaycastFilterType.Exclude
+                params.FilterDescendantsInstances = {model}
+                local result = workspace:Raycast(originPart.Position, offset, params)
+                if result and result.Instance and result.Instance:IsDescendantOf(character) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 -- Surroundings awareness
 local function checkSurroundings(character, root, candidates)
     local nearest, nearestDistance = closestTwisted(root, candidates)
@@ -446,6 +478,18 @@ task.spawn(function()
             threatText, obstacleText, nearest, nearestDistance =
                 checkSurroundings(character, root, validTwisteds)
 
+            local seesPlayer = isPlayerSpotted(character, root, validTwisteds)
+            if seesPlayer then
+                playerSpotted = true
+                lostSightSince = nil
+            elseif playerSpotted then
+                lostSightSince = lostSightSince or os.clock()
+                if os.clock() - lostSightSince >= SIGHT_REENABLE_DELAY then
+                    playerSpotted = false
+                    lostSightSince = nil
+                end
+            end
+
             -- Prefer a Twisted actively sprinting toward the player.
             local chargingTarget = nil
             local chargingDistance = math.huge
@@ -463,12 +507,19 @@ task.spawn(function()
             currentTarget = chargingTarget or closestTwisted(root, validTwisteds)
 
             -- Auto Aggro
-            if settings.aggro and currentTarget then
+            if settings.aggro and not playerSpotted and currentTarget then
                 local enemyRoot = getRoot(currentTarget)
 
                 if enemyRoot then
                     requestMove(character, humanoid, root, enemyRoot.Position)
                 end
+
+            -- Pause Auto Aggro while a Twisted has line of sight to the player.
+            -- The user's Auto Aggro toggle remains enabled and resumes after sight is lost.
+            elseif settings.aggro and playerSpotted and not settings.run then
+                smoothedFleeDirection = Vector3.zero
+                humanoid:Move(Vector3.zero, false)
+                stopMovement()
 
             -- Auto Run Away: flee immediately from a charging Twisted,
             -- even when it is still outside the normal safe distance.
@@ -483,18 +534,29 @@ task.spawn(function()
                         local away = root.Position - enemyRoot.Position
 
                         if away.Magnitude > 0 then
-                            local destination = root.Position + away.Unit * RETREAT_DISTANCE
-                            requestMove(character, humanoid, root, destination)
+                            -- Use continuous Humanoid steering for fleeing instead of
+                            -- repeatedly rebuilding paths. This avoids stop/start jitter.
+                            stopMovement()
+                            smoothedFleeDirection = smoothedFleeDirection:Lerp(away.Unit, FLEE_SMOOTHING)
+                            if smoothedFleeDirection.Magnitude > 0.01 then
+                                humanoid:Move(smoothedFleeDirection.Unit, false)
+                            end
                         end
                     else
+                        smoothedFleeDirection = Vector3.zero
+                        humanoid:Move(Vector3.zero, false)
                         stopMovement()
                     end
                 end
             else
+                humanoid:Move(Vector3.zero, false)
                 stopMovement()
             end
         else
             currentTarget = nil
+            if humanoid then
+                humanoid:Move(Vector3.zero, false)
+            end
             stopMovement()
         end
 
@@ -504,7 +566,10 @@ task.spawn(function()
             "\nTarget: " .. (currentTarget and currentTarget.Name or "None") ..
             "\nNearest threat: " .. threatText ..
             "\nObstacle ahead: " .. obstacleText ..
+            "\nTwisted sight: " .. (playerSpotted and "SPOTTED" or "CLEAR") ..
+            "\nAuto Aggro: " .. (not settings.aggro and "OFF" or (playerSpotted and "PAUSED" or "ON")) ..
             "\nNoclip: " .. (settings.noclip and "ON" or "OFF")
+        aggroButton.Text = "AUTO AGGRO: " .. (not settings.aggro and "OFF" or (playerSpotted and "PAUSED" or "ON"))
 
         task.wait(CHECK_INTERVAL)
     end
